@@ -1,6 +1,8 @@
 [package]
-name = "audio_player"
+name = "media_player"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ffmpeg-next = "8.1.0"
+minifb = "0.28.0"

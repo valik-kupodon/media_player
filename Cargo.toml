@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ffmpeg-next = "8.1.0"
 minifb = "0.28.0"
+rodio = "0.22.2"

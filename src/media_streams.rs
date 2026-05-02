@@ -3,25 +3,37 @@ use ffmpeg::media::Type;
 use ffmpeg::software::resampling::Context as AudioResampler;
 use ffmpeg::software::scaling::{context::Context as VideoScaler, flag::Flags};
 use ffmpeg_next as ffmpeg;
-use minifb::{Key, Window, WindowOptions};
 use rodio::{MixerDeviceSink, Player, buffer::SamplesBuffer};
 use std::error::Error;
 use std::io;
 use std::num::{NonZeroU16, NonZeroU32};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub struct VideoFrame {
+    pub width: usize,
+    pub height: usize,
+    pub rgb_data: Vec<u8>,
+}
+
 pub struct MediaStreams {
     file_path: String,
+    shared_volume: Arc<AtomicU32>,
+    shared_paused: Arc<AtomicBool>,
 }
 
 struct VideoPlayback {
     stream_index: usize,
     time_base: ffmpeg::Rational,
+    width: usize,
+    height: usize,
     decoder: ffmpeg::decoder::Video,
     scaler: VideoScaler,
-    window: Window,
-    window_buffer: Vec<u32>,
     decoded_frame: ffmpeg::frame::Video,
     rgb_frame: ffmpeg::frame::Video,
 }
@@ -36,45 +48,32 @@ struct AudioPlayback {
 }
 
 impl MediaStreams {
-    pub fn new(file_path: impl Into<String>) -> Self {
+    pub fn new(
+        file_path: impl Into<String>,
+        shared_volume: Arc<AtomicU32>,
+        shared_paused: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             file_path: file_path.into(),
+            shared_volume,
+            shared_paused,
         }
     }
 
-    pub fn play(&self) -> Result<(), Box<dyn Error>> {
-        println!("🎬🔊 Ініціалізую медіапотік...");
+    pub fn play_with_video_tx(
+        &self,
+        video_tx: SyncSender<VideoFrame>,
+    ) -> Result<(), Box<dyn Error>> {
         ffmpeg::init()?;
 
         let mut ictx = ffmpeg::format::input(&self.file_path)?;
         let mut video = Self::create_video_playback(&ictx)?;
         let mut audio = Self::create_audio_playback(&ictx)?;
 
-        if video.is_none() && audio.is_none() {
-            return Err(Box::new(ffmpeg::Error::StreamNotFound));
-        }
-
-        if let Some(video) = video.as_ref() {
-            println!(
-                "▶ Відтворюємо: {} ({}x{})",
-                self.file_path,
-                video.window_buffer.len() / video.window.get_size().1,
-                video.window.get_size().1
-            );
-        } else {
-            println!("▶ Відтворюємо аудіо: {}", self.file_path);
-        }
-
-        let mut interrupted = false;
         let mut video_clock = None;
 
         for (stream, packet) in ictx.packets() {
-            if let Some(video) = video.as_mut() {
-                if !video.window.is_open() || video.window.is_key_down(Key::Escape) {
-                    interrupted = true;
-                    break;
-                }
-            }
+            Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
 
             if let Some(video) = video.as_mut()
                 && stream.index() == video.stream_index
@@ -86,7 +85,14 @@ impl MediaStreams {
                     .receive_frame(&mut video.decoded_frame)
                     .is_ok()
                 {
-                    Self::render_video_frame(video, &mut video_clock)?;
+                    Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
+                    let frame = Self::decode_video_frame(video, &mut video_clock)?;
+
+                    match video_tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => return Ok(()),
+                    }
                 }
             }
 
@@ -100,47 +106,59 @@ impl MediaStreams {
                     .receive_frame(&mut audio.decoded_frame)
                     .is_ok()
                 {
+                    Self::wait_if_paused(Some(audio), &self.shared_paused, &mut video_clock);
+                    let current_volume = f32::from_bits(self.shared_volume.load(Ordering::Relaxed));
                     Self::append_audio_frame(
                         &audio.player,
                         &mut audio.resampler,
                         &audio.decoded_frame,
+                        current_volume,
                     )?;
                 }
             }
         }
 
-        if !interrupted {
-            if let Some(video) = video.as_mut() {
-                video.decoder.send_eof()?;
-                while video
-                    .decoder
-                    .receive_frame(&mut video.decoded_frame)
-                    .is_ok()
-                {
-                    Self::render_video_frame(video, &mut video_clock)?;
+        if let Some(video) = video.as_mut() {
+            video.decoder.send_eof()?;
+            while video
+                .decoder
+                .receive_frame(&mut video.decoded_frame)
+                .is_ok()
+            {
+                Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
+                let frame = Self::decode_video_frame(video, &mut video_clock)?;
+                match video_tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
                 }
-            }
-
-            if let Some(audio) = audio.as_mut() {
-                audio.decoder.send_eof()?;
-                while audio
-                    .decoder
-                    .receive_frame(&mut audio.decoded_frame)
-                    .is_ok()
-                {
-                    Self::append_audio_frame(
-                        &audio.player,
-                        &mut audio.resampler,
-                        &audio.decoded_frame,
-                    )?;
-                }
-
-                Self::flush_audio_resampler(&audio.player, &mut audio.resampler)?;
-                audio.player.sleep_until_end();
             }
         }
 
-        println!("✅ Відтворення завершено.");
+        if let Some(audio) = audio.as_mut() {
+            audio.decoder.send_eof()?;
+            while audio
+                .decoder
+                .receive_frame(&mut audio.decoded_frame)
+                .is_ok()
+            {
+                Self::wait_if_paused(Some(audio), &self.shared_paused, &mut video_clock);
+                Self::append_audio_frame(
+                    &audio.player,
+                    &mut audio.resampler,
+                    &audio.decoded_frame,
+                    f32::from_bits(self.shared_volume.load(Ordering::Relaxed)),
+                )?;
+            }
+
+            Self::flush_audio_resampler(
+                &audio.player,
+                &mut audio.resampler,
+                f32::from_bits(self.shared_volume.load(Ordering::Relaxed)),
+            )?;
+            audio.player.sleep_until_end();
+        }
+
         Ok(())
     }
 
@@ -168,20 +186,13 @@ impl MediaStreams {
             Flags::BILINEAR,
         )?;
 
-        let window = Window::new(
-            "Mедіа плеер Валентина",
-            width,
-            height,
-            WindowOptions::default(),
-        )?;
-
         Ok(Some(VideoPlayback {
             stream_index,
             time_base,
+            width,
+            height,
             decoder,
             scaler,
-            window,
-            window_buffer: vec![0; width * height],
             decoded_frame: ffmpeg::frame::Video::empty(),
             rgb_frame: ffmpeg::frame::Video::empty(),
         }))
@@ -227,53 +238,89 @@ impl MediaStreams {
         }))
     }
 
-    fn render_video_frame(
+    fn decode_video_frame(
         video: &mut VideoPlayback,
         video_clock: &mut Option<(f64, Instant)>,
-    ) -> Result<(), Box<dyn Error>> {
-        Self::sync_video(
-            video.decoded_frame.timestamp(),
-            video.time_base,
-            video_clock,
-        );
+    ) -> Result<VideoFrame, Box<dyn Error>> {
+        let pts = video
+            .decoded_frame
+            .timestamp()
+            .map(|ts| ts as f64 * f64::from(video.time_base))
+            .unwrap_or(0.0);
+
+        Self::sync_video(pts, video_clock);
 
         video
             .scaler
             .run(&video.decoded_frame, &mut video.rgb_frame)?;
-        let data = video.rgb_frame.data(0);
 
-        for (i, pixel) in video.window_buffer.iter_mut().enumerate() {
-            let r = data[i * 3] as u32;
-            let g = data[i * 3 + 1] as u32;
-            let b = data[i * 3 + 2] as u32;
-            *pixel = (255 << 24) | (r << 16) | (g << 8) | b;
-        }
-
-        let (width, height) = video.window.get_size();
-        video
-            .window
-            .update_with_buffer(&video.window_buffer, width, height)?;
-
-        Ok(())
+        Ok(Self::copy_rgb_frame(
+            &video.rgb_frame,
+            video.width,
+            video.height,
+            pts,
+        ))
     }
 
-    fn sync_video(
-        timestamp: Option<i64>,
-        time_base: ffmpeg::Rational,
-        video_clock: &mut Option<(f64, Instant)>,
-    ) {
-        let Some(timestamp) = timestamp else {
-            thread::sleep(Duration::from_millis(33));
-            return;
-        };
+    fn copy_rgb_frame(
+        frame: &ffmpeg::frame::Video,
+        width: usize,
+        height: usize,
+        _pts: f64,
+    ) -> VideoFrame {
+        let stride = frame.stride(0);
+        let src = frame.data(0);
+        let row_len = width * 3;
 
-        let seconds = timestamp as f64 * f64::from(time_base);
-        let (origin_seconds, playback_start) = video_clock.get_or_insert((seconds, Instant::now()));
-        let target = Duration::from_secs_f64((seconds - *origin_seconds).max(0.0));
-        let elapsed = playback_start.elapsed();
+        let mut rgb_data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            let start = y * stride;
+            rgb_data.extend_from_slice(&src[start..start + row_len]);
+        }
+
+        VideoFrame {
+            width,
+            height,
+            rgb_data,
+        }
+    }
+
+    fn sync_video(pts: f64, video_clock: &mut Option<(f64, Instant)>) {
+        let (origin_pts, start) = video_clock.get_or_insert((pts, Instant::now()));
+        let target = Duration::from_secs_f64((pts - *origin_pts).max(0.0));
+        let elapsed = start.elapsed();
 
         if target > elapsed {
             thread::sleep(target - elapsed);
+        }
+    }
+
+    fn wait_if_paused(
+        audio: Option<&AudioPlayback>,
+        shared_paused: &AtomicBool,
+        video_clock: &mut Option<(f64, Instant)>,
+    ) {
+        let mut was_paused = false;
+
+        while shared_paused.load(Ordering::Relaxed) {
+            if let Some(audio) = audio
+                && !audio.player.is_paused()
+            {
+                audio.player.pause();
+            }
+
+            was_paused = true;
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        if let Some(audio) = audio
+            && audio.player.is_paused()
+        {
+            audio.player.play();
+        }
+
+        if was_paused {
+            *video_clock = None;
         }
     }
 
@@ -281,15 +328,17 @@ impl MediaStreams {
         player: &Player,
         resampler: &mut AudioResampler,
         decoded_frame: &ffmpeg::frame::Audio,
+        currnet_volume: f32,
     ) -> Result<(), Box<dyn Error>> {
         let mut resampled_frame = ffmpeg::frame::Audio::empty();
         resampler.run(decoded_frame, &mut resampled_frame)?;
-        Self::queue_audio_buffer(player, &resampled_frame)
+        Self::queue_audio_buffer(player, &resampled_frame, currnet_volume)
     }
 
     fn queue_audio_buffer(
         player: &Player,
         audio_frame: &ffmpeg::frame::Audio,
+        current_volume: f32,
     ) -> Result<(), Box<dyn Error>> {
         let channels = NonZeroU16::new(audio_frame.channels()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "audio frame has zero channels")
@@ -304,20 +353,24 @@ impl MediaStreams {
         let samples = audio_frame
             .data(0)
             .chunks_exact(std::mem::size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 chunks are sized")))
+            .map(|chunk| {
+                let raw_sample =
+                    f32::from_ne_bytes(chunk.try_into().expect("f32 chunks are sized"));
+                raw_sample * current_volume
+            })
             .collect::<Vec<_>>();
 
-        if samples.is_empty() {
-            return Ok(());
+        if !samples.is_empty() {
+            player.append(SamplesBuffer::new(channels, sample_rate, samples));
         }
 
-        player.append(SamplesBuffer::new(channels, sample_rate, samples));
         Ok(())
     }
 
     fn flush_audio_resampler(
         player: &Player,
         resampler: &mut AudioResampler,
+        current_volume: f32,
     ) -> Result<(), Box<dyn Error>> {
         while let Some(delay) = resampler.delay() {
             if delay.output <= 0 {
@@ -338,7 +391,7 @@ impl MediaStreams {
                 break;
             }
 
-            Self::queue_audio_buffer(player, &delayed_frame)?;
+            Self::queue_audio_buffer(player, &delayed_frame, current_volume)?;
         }
 
         Ok(())

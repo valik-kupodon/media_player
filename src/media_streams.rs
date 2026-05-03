@@ -10,7 +10,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,12 +19,15 @@ pub struct VideoFrame {
     pub width: usize,
     pub height: usize,
     pub rgb_data: Vec<u8>,
+    pub pts: f64,
+    pub duration: f64,
 }
 
 pub struct MediaStreams {
     file_path: String,
     shared_volume: Arc<AtomicU32>,
     shared_paused: Arc<AtomicBool>,
+    shared_seek: Arc<AtomicU64>, // Використовуємо AtomicU32 для зберігання бітів f64
 }
 
 struct VideoPlayback {
@@ -52,11 +55,13 @@ impl MediaStreams {
         file_path: impl Into<String>,
         shared_volume: Arc<AtomicU32>,
         shared_paused: Arc<AtomicBool>,
+        shared_seek: Arc<AtomicU64>,
     ) -> Self {
         Self {
             file_path: file_path.into(),
             shared_volume,
             shared_paused,
+            shared_seek,
         }
     }
 
@@ -67,16 +72,45 @@ impl MediaStreams {
         ffmpeg::init()?;
 
         let mut ictx = ffmpeg::format::input(&self.file_path)?;
+        let duration = ictx.duration() as f64 / ffmpeg::ffi::AV_TIME_BASE as f64;
         let mut video = Self::create_video_playback(&ictx)?;
         let mut audio = Self::create_audio_playback(&ictx)?;
 
         let mut video_clock = None;
 
-        for (stream, packet) in ictx.packets() {
+        loop {
             Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
+            let seek_val = f64::from_bits(self.shared_seek.load(Ordering::Relaxed));
+            if !seek_val.is_nan() {
+                // FFmpeg оперує мікросекундами (AV_TIME_BASE = 1_000_000)
+                let target_ts = (seek_val * 1_000_000.0) as i64;
 
+                // Виконуємо стрибок до найближчого ключового кадру
+                let _ = ictx.seek(target_ts, ..);
+
+                // ОЧИЩАЄМО БУФЕРИ ДЕКОДЕРІВ (інакше на екран вилізуть старі кадри)
+                if let Some(v) = video.as_mut() {
+                    v.decoder.flush();
+                }
+                if let Some(a) = audio.as_mut() {
+                    a.decoder.flush();
+                }
+
+                // КРИТИЧНО ВАЖЛИВО: скидаємо годинник, щоб відео не чекало старого часу
+                video_clock = None;
+
+                // Скидаємо прапорець назад у "Вимкнено"
+                self.shared_seek
+                    .store(f64::NAN.to_bits(), Ordering::Relaxed);
+            }
+
+            // --- 2. ВРУЧНУ ЧИТАЄМО ПАКЕТ ---
+            let mut packet = ffmpeg::Packet::empty();
+            if packet.read(&mut ictx).is_err() {
+                break; // Пакети закінчилися (EOF)
+            }
             if let Some(video) = video.as_mut()
-                && stream.index() == video.stream_index
+                && packet.stream() == video.stream_index
             {
                 video.decoder.send_packet(&packet)?;
 
@@ -86,7 +120,7 @@ impl MediaStreams {
                     .is_ok()
                 {
                     Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
-                    let frame = Self::decode_video_frame(video, &mut video_clock)?;
+                    let frame = Self::decode_video_frame(video, &mut video_clock, duration)?;
 
                     match video_tx.try_send(frame) {
                         Ok(()) => {}
@@ -97,7 +131,7 @@ impl MediaStreams {
             }
 
             if let Some(audio) = audio.as_mut()
-                && stream.index() == audio.stream_index
+                && packet.stream() == audio.stream_index
             {
                 audio.decoder.send_packet(&packet)?;
 
@@ -126,7 +160,7 @@ impl MediaStreams {
                 .is_ok()
             {
                 Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut video_clock);
-                let frame = Self::decode_video_frame(video, &mut video_clock)?;
+                let frame = Self::decode_video_frame(video, &mut video_clock, duration)?;
                 match video_tx.try_send(frame) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {}
@@ -241,6 +275,7 @@ impl MediaStreams {
     fn decode_video_frame(
         video: &mut VideoPlayback,
         video_clock: &mut Option<(f64, Instant)>,
+        duration: f64,
     ) -> Result<VideoFrame, Box<dyn Error>> {
         let pts = video
             .decoded_frame
@@ -259,6 +294,7 @@ impl MediaStreams {
             video.width,
             video.height,
             pts,
+            duration,
         ))
     }
 
@@ -266,7 +302,8 @@ impl MediaStreams {
         frame: &ffmpeg::frame::Video,
         width: usize,
         height: usize,
-        _pts: f64,
+        pts: f64,
+        duration: f64,
     ) -> VideoFrame {
         let stride = frame.stride(0);
         let src = frame.data(0);
@@ -282,6 +319,8 @@ impl MediaStreams {
             width,
             height,
             rgb_data,
+            pts,
+            duration,
         }
     }
 

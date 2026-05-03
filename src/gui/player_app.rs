@@ -3,7 +3,7 @@ use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 
@@ -17,6 +17,11 @@ pub struct PlayerApp {
     shared_volume: Arc<AtomicU32>,
     shared_paused: Arc<AtomicBool>,
     pub is_hide_playlist: bool,
+    current_time: f64,
+    total_time: f64,
+    shared_seek: Arc<AtomicU64>,
+    is_dragging: bool,
+    drag_time: f64,
 }
 
 impl PlayerApp {
@@ -31,6 +36,11 @@ impl PlayerApp {
             shared_volume: Arc::new(AtomicU32::new(0.5_f32.to_bits())),
             shared_paused: Arc::new(AtomicBool::new(false)),
             is_hide_playlist: false,
+            current_time: 0.0,
+            total_time: 0.0,
+            shared_seek: Arc::new(AtomicU64::new(0)),
+            is_dragging: false,
+            drag_time: 0.0,
         }
     }
 
@@ -39,9 +49,11 @@ impl PlayerApp {
         video_tx: SyncSender<VideoFrame>,
         shared_volume: Arc<AtomicU32>,
         shared_paused: Arc<AtomicBool>,
+        shader_seek: Arc<AtomicU64>,
     ) {
         thread::spawn(move || {
-            let media_streams = MediaStreams::new(file_path, shared_volume, shared_paused);
+            let media_streams =
+                MediaStreams::new(file_path, shared_volume, shared_paused, shader_seek);
 
             if let Err(e) = media_streams.play_with_video_tx(video_tx) {
                 eprintln!("Помилка при відтворенні медіа: {}", e);
@@ -52,6 +64,7 @@ impl PlayerApp {
     pub fn play_track(&mut self, index: usize) {
         if index >= self.playlist.len() {
             eprintln!("Індекс поза межами плейлиста: {}", index);
+            self.is_playing = false;
             return;
         }
         self.current_index = index;
@@ -68,6 +81,7 @@ impl PlayerApp {
             new_tx,
             Arc::clone(&self.shared_volume),
             Arc::clone(&self.shared_paused),
+            Arc::clone(&self.shared_seek),
         );
 
         // Підміняємо трубу та очищаємо старий кадр
@@ -75,6 +89,7 @@ impl PlayerApp {
         self.texture = None; // Щоб на мить з'явився напис "Завантаження..."
         self.is_playing = true;
     }
+
     fn handle_input(&mut self, ctx: &eframe::egui::Context) {
         if !ctx.egui_wants_keyboard_input() {
             if ctx.input(|i| i.key_pressed(eframe::egui::Key::Space)) {
@@ -140,6 +155,43 @@ impl PlayerApp {
         });
     }
 
+    fn draw_time_seeker(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = ui.available_width();
+
+            let visuals = ui.visuals_mut();
+            visuals.selection.bg_fill = eframe::egui::Color32::from_rgb(220, 20, 40);
+            visuals.widgets.inactive.fg_stroke.color = eframe::egui::Color32::WHITE;
+            visuals.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(40, 40, 40);
+
+            let mut display_time = if self.is_dragging {
+                self.drag_time
+            } else {
+                self.current_time
+            };
+
+            let response = ui.add(
+                eframe::egui::Slider::new(&mut display_time, 0.0..=self.total_time)
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+
+            if response.drag_started() {
+                self.is_dragging = true;
+            }
+            if response.dragged() {
+                self.drag_time = display_time;
+            }
+            if response.drag_stopped() {
+                self.is_dragging = false;
+                self.shared_seek
+                    .store(display_time.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        ui.add_space(5.0);
+    }
+
     /// Нижня панель керування
     fn draw_controls(&mut self, ui: &mut eframe::egui::Ui) {
         ui.horizontal(|ui| {
@@ -169,8 +221,13 @@ impl PlayerApp {
             }
 
             ui.add_space(15.0);
+            let timecode = format!(
+                "{} / {}",
+                Self::format_time(self.current_time),
+                Self::format_time(self.total_time)
+            );
             ui.label(
-                eframe::egui::RichText::new("00:00 / 00:00")
+                eframe::egui::RichText::new(timecode)
                     .size(16.0)
                     .color(eframe::egui::Color32::RED),
             );
@@ -232,28 +289,66 @@ impl PlayerApp {
         }
     }
     fn process_video_frames(&mut self, ctx: &eframe::egui::Context) {
+        // Якщо плеєр на паузі - взагалі не читаємо кадри
+        if !self.is_playing {
+            return;
+        }
+
         let mut latest_frame = None;
 
-        // Дренуємо канал, щоб отримати найсвіжіший кадр
-        while let Ok(frame) = self.video_rx.try_recv() {
-            latest_frame = Some(frame);
-        }
+        // 1. Дренуємо канал через loop + match
+        loop {
+            match self.video_rx.try_recv() {
+                // Отримали кадр - запам'ятовуємо його як найсвіжіший і крутимо цикл далі
+                Ok(frame) => {
+                    latest_frame = Some(frame);
+                }
 
-        // Оновлюємо текстуру тільки якщо ми граємо і прийшов новий кадр
-        if self.is_playing {
-            if let Some(frame) = latest_frame {
-                let image = eframe::egui::ColorImage::from_rgb(
-                    [frame.width, frame.height],
-                    &frame.rgb_data,
-                );
+                // Канали порожні, ми вичитали все, що було на цю мілісекунду.
+                // Зупиняємо дренування (виходимо з loop) і йдемо малювати.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    break;
+                }
 
-                self.texture = Some(ctx.load_texture(
-                    "vid_frame",
-                    image,
-                    eframe::egui::TextureOptions::LINEAR,
-                ));
+                // Зв'язок розірвано! Відео закінчилося.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // ТУТ ЖИВЕ АВТОВІДТВОРЕННЯ
+                    if self.current_index + 1 < self.playlist.len() {
+                        self.play_track(self.current_index + 1);
+                    } else {
+                        // Плейлист закінчився, зациклюємо його
+                        self.current_time = 0.0;
+                        self.texture = None;
+                        self.play_track(1);
+                    }
+
+                    // КРИТИЧНО: виходимо з усієї функції, бо трек вже перемкнувся!
+                    return;
+                }
             }
         }
+
+        // 2. Якщо після дренування у нас є новий кадр - малюємо його
+        if let Some(frame) = latest_frame {
+            self.current_time = frame.pts;
+            self.total_time = frame.duration;
+
+            let image =
+                eframe::egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb_data);
+
+            self.texture =
+                Some(ctx.load_texture("vid_frame", image, eframe::egui::TextureOptions::LINEAR));
+        }
+    }
+
+    fn format_time(seconds: f64) -> String {
+        if seconds.is_nan() || seconds < 0.0 {
+            return "00:00".to_string();
+        }
+        let total_secs = seconds as u64;
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{:02}:{:02}", mins, secs)
     }
 }
 
@@ -267,35 +362,26 @@ impl eframe::App for PlayerApp {
         if !self.is_hide_playlist {
             self.draw_playlist_panel(ui);
         }
-
+        eframe::egui::Panel::bottom("controls_panel").show_inside(ui, |ui| {
+            ui.add_space(8.0);
+            self.draw_time_seeker(ui);
+            self.draw_controls(ui);
+        });
         eframe::egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.ctx().set_visuals(eframe::egui::Visuals::dark());
 
-            ui.with_layout(
-                eframe::egui::Layout::bottom_up(eframe::egui::Align::Center),
-                |ui| {
-                    ui.add_space(10.0);
-
-                    // Малюємо керування
-                    self.draw_controls(ui);
-
-                    ui.add_space(10.0);
-                    ui.separator();
-
-                    // МАЛЮВАННЯ САМОГО ВІДЕО
-                    if let Some(texture) = &self.texture {
-                        ui.image((texture.id(), ui.available_size()));
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                eframe::egui::RichText::new("Завантаження відео...")
-                                    .size(30.0)
-                                    .strong(),
-                            );
-                        });
-                    }
-                },
-            );
+            // МАЛЮВАННЯ САМОГО ВІДЕО
+            if let Some(texture) = &self.texture {
+                ui.image((texture.id(), ui.available_size()));
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        eframe::egui::RichText::new("Завантаження відео...")
+                            .size(30.0)
+                            .strong(),
+                    );
+                });
+            }
         });
 
         if self.is_playing {

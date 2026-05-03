@@ -16,19 +16,21 @@ pub struct PlayerApp {
     current_index: usize,
     shared_volume: Arc<AtomicU32>,
     shared_paused: Arc<AtomicBool>,
+    pub is_hide_playlist: bool,
 }
 
 impl PlayerApp {
-    pub fn new(video_rx: Receiver<VideoFrame>, playlist: Vec<String>) -> Self {
+    pub fn new(video_rx: Receiver<VideoFrame>) -> Self {
         Self {
             video_rx,
             texture: None,
             is_playing: true,
             volume: 0.5,
-            playlist,
+            playlist: Vec::new(),
             current_index: 0,
             shared_volume: Arc::new(AtomicU32::new(0.5_f32.to_bits())),
             shared_paused: Arc::new(AtomicBool::new(false)),
+            is_hide_playlist: false,
         }
     }
 
@@ -73,39 +75,34 @@ impl PlayerApp {
         self.texture = None; // Щоб на мить з'явився напис "Завантаження..."
         self.is_playing = true;
     }
-}
-
-impl eframe::App for PlayerApp {
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
-        if !ui.ctx().egui_wants_keyboard_input() {
-            if ui.ctx().input(|i| i.key_pressed(eframe::egui::Key::Space)) {
-                self.is_playing = !self.is_playing;
-                self.shared_paused
-                    .store(!self.is_playing, Ordering::Relaxed);
+    fn handle_input(&mut self, ctx: &eframe::egui::Context) {
+        if !ctx.egui_wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(eframe::egui::Key::Space)) {
+                self.toggle_play();
             }
         }
-        // Завжди дренуємо канал кадрів, інакше decoder thread може заблокуватися
-        // на повному sync_channel і разом з відео зупинить аудіо.
+    }
+
+    /// Перемикання паузи (щоб не дублювати логіку в кнопці та пробілі)
+    fn toggle_play(&mut self) {
+        self.is_playing = !self.is_playing;
+        self.shared_paused
+            .store(!self.is_playing, Ordering::Relaxed);
+    }
+
+    /// Права панель - Плейлист
+    fn draw_playlist_panel(&mut self, ui: &mut eframe::egui::Ui) {
         eframe::egui::Panel::right("playlist_panel")
             .default_size(200.0)
             .show_inside(ui, |ui| {
                 ui.heading("Плейлист");
                 ui.separator();
 
-                // Кнопка відкриття діалогу вибору файлів
                 if ui.button("📂 Додати відео...").clicked() {
-                    // Викликаємо нативне вікно Linux
-                    if let Some(files) = rfd::FileDialog::new()
-                        .set_title("Виберіть файли для плейлиста")
-                        .pick_files()
-                    // Дозволяє вибрати кілька файлів (Shift/Ctrl)
-                    {
-                        // Додаємо вибрані файли в наш вектор
+                    if let Some(files) = rfd::FileDialog::new().pick_files() {
                         for path in files {
                             self.playlist.push(path.to_string_lossy().to_string());
                         }
-
-                        // Якщо це перше відео, яке ми додали - одразу вмикаємо його
                         if self.playlist.len() > 0 && !self.is_playing && self.texture.is_none() {
                             self.play_track(0);
                         }
@@ -113,129 +110,174 @@ impl eframe::App for PlayerApp {
                 }
 
                 ui.separator();
-                eframe::egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut track_to_play = None;
-
-                    for (index, file_path) in self.playlist.iter().enumerate() {
-                        // Витягуємо тільки назву файлу з довгого шляху для краси
-                        let file_name = std::path::Path::new(file_path)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-
-                        // Виділяємо поточний трек іншим кольором
-                        let is_current = index == self.current_index;
-                        let text = eframe::egui::RichText::new(file_name).color(if is_current {
-                            eframe::egui::Color32::GREEN
-                        } else {
-                            eframe::egui::Color32::LIGHT_GRAY
-                        });
-
-                        // Якщо клікнули по назві в плейлисті - запам'ятовуємо індекс
-                        if ui.selectable_label(is_current, text).clicked() {
-                            track_to_play = Some(index);
-                        }
-                    }
-
-                    // Якщо користувач клікнув на трек - перемикаємо (робимо це поза циклом)
-                    if let Some(index) = track_to_play {
-                        self.play_track(index);
-                    }
-                });
+                self.draw_tracks_list(ui);
             });
-        eframe::egui::CentralPanel::default().show_inside(ui, |ui| {
-            let mut latest_frame = None;
-            while let Ok(frame) = self.video_rx.try_recv() {
-                latest_frame = Some(frame);
+    }
+
+    fn draw_tracks_list(&mut self, ui: &mut eframe::egui::Ui) {
+        eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut track_to_play = None;
+            for (index, file_path) in self.playlist.iter().enumerate() {
+                let file_name = std::path::Path::new(file_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+
+                let is_current = index == self.current_index;
+                let text = eframe::egui::RichText::new(file_name).color(if is_current {
+                    eframe::egui::Color32::GREEN
+                } else {
+                    eframe::egui::Color32::LIGHT_GRAY
+                });
+
+                if ui.selectable_label(is_current, text).clicked() {
+                    track_to_play = Some(index);
+                }
+            }
+            if let Some(index) = track_to_play {
+                self.play_track(index);
+            }
+        });
+    }
+
+    /// Нижня панель керування
+    fn draw_controls(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+
+            // Кнопка Play/Pause
+            let play_text = if self.is_playing {
+                "⏸ Пауза"
+            } else {
+                "▶ Відтворити"
+            };
+            let color = if self.is_playing {
+                eframe::egui::Color32::LIGHT_RED
+            } else {
+                eframe::egui::Color32::GREEN
+            };
+
+            if ui
+                .button(
+                    eframe::egui::RichText::new(play_text)
+                        .size(18.0)
+                        .color(color),
+                )
+                .clicked()
+            {
+                self.toggle_play();
             }
 
-            if self.is_playing
-                && let Some(frame) = latest_frame
+            ui.add_space(15.0);
+            ui.label(
+                eframe::egui::RichText::new("00:00 / 00:00")
+                    .size(16.0)
+                    .color(eframe::egui::Color32::RED),
+            );
+
+            ui.separator();
+            self.draw_nav_buttons(ui);
+            self.draw_volume_slider(ui);
+            let toggle_text = if self.is_hide_playlist {
+                "📂 Показати плейлист"
+            } else {
+                "📁 Приховати плейлист"
+            };
+            if ui
+                .selectable_label(!self.is_hide_playlist, toggle_text)
+                .clicked()
             {
+                self.is_hide_playlist = !self.is_hide_playlist;
+            }
+        });
+    }
+
+    fn draw_nav_buttons(&mut self, ui: &mut eframe::egui::Ui) {
+        if ui
+            .button(
+                eframe::egui::RichText::new("⏮ Prev")
+                    .size(15.0)
+                    .color(eframe::egui::Color32::LIGHT_BLUE),
+            )
+            .clicked()
+        {
+            let idx = if self.current_index > 0 {
+                self.current_index - 1
+            } else {
+                self.playlist.len() - 1
+            };
+            self.play_track(idx);
+        }
+        if ui
+            .button(
+                eframe::egui::RichText::new("⏭ Next")
+                    .size(15.0)
+                    .color(eframe::egui::Color32::LIGHT_BLUE),
+            )
+            .clicked()
+        {
+            let idx = (self.current_index + 1) % self.playlist.len();
+            self.play_track(idx);
+        }
+    }
+
+    fn draw_volume_slider(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.label("🔊");
+        if ui
+            .add(eframe::egui::Slider::new(&mut self.volume, 0.0..=3.0).show_value(false))
+            .changed()
+        {
+            self.shared_volume
+                .store(self.volume.to_bits(), Ordering::Relaxed);
+        }
+    }
+    fn process_video_frames(&mut self, ctx: &eframe::egui::Context) {
+        let mut latest_frame = None;
+
+        // Дренуємо канал, щоб отримати найсвіжіший кадр
+        while let Ok(frame) = self.video_rx.try_recv() {
+            latest_frame = Some(frame);
+        }
+
+        // Оновлюємо текстуру тільки якщо ми граємо і прийшов новий кадр
+        if self.is_playing {
+            if let Some(frame) = latest_frame {
                 let image = eframe::egui::ColorImage::from_rgb(
                     [frame.width, frame.height],
                     &frame.rgb_data,
                 );
 
-                self.texture = Some(ui.ctx().load_texture(
+                self.texture = Some(ctx.load_texture(
                     "vid_frame",
                     image,
                     eframe::egui::TextureOptions::LINEAR,
                 ));
             }
+        }
+    }
+}
 
-            // --- 2. МАЛЮВАННЯ ІНТЕРФЕЙСУ ---
+impl eframe::App for PlayerApp {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        // 1. Логіка оновлення стану
+        self.handle_input(ui.ctx());
+        self.process_video_frames(ui.ctx()); // Винесли отримання кадрів
+
+        // 2. Рендеринг панелей
+        if !self.is_hide_playlist {
+            self.draw_playlist_panel(ui);
+        }
+
+        eframe::egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.ctx().set_visuals(eframe::egui::Visuals::dark());
 
-            // Малюємо панель знизу вгору
             ui.with_layout(
                 eframe::egui::Layout::bottom_up(eframe::egui::Align::Center),
                 |ui| {
                     ui.add_space(10.0);
 
-                    // КНОПКИ КЕРУВАННЯ
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        let button_text = if self.is_playing {
-                            "⏸ Пауза"
-                        } else {
-                            "▶ Відтворити"
-                        };
-                        let styled_text = eframe::egui::RichText::new(button_text)
-                            .size(18.0)
-                            .color(if self.is_playing {
-                                eframe::egui::Color32::LIGHT_RED
-                            } else {
-                                eframe::egui::Color32::GREEN
-                            });
-
-                        // Зміна стану по кліку
-                        if ui.button(styled_text).clicked() {
-                            self.is_playing = !self.is_playing;
-                            self.shared_paused
-                                .store(!self.is_playing, Ordering::Relaxed);
-                        }
-
-                        ui.add_space(15.0);
-                        ui.label(
-                            eframe::egui::RichText::new("00:00 / 00:00")
-                                .size(16.0)
-                                .color(eframe::egui::Color32::RED),
-                        );
-
-                        ui.separator();
-                        ui.label("🔊");
-                        let prev_button = eframe::egui::RichText::new("⏮ Prev")
-                            .size(15.0)
-                            .color(eframe::egui::Color32::LIGHT_BLUE);
-                        if ui.button(prev_button).clicked() {
-                            if self.current_index > 0 {
-                                self.play_track(self.current_index - 1);
-                            } else if self.current_index == 0 {
-                                self.play_track(self.playlist.len() - 1); // Зациклюємо на останній трек
-                            }
-                        }
-                        let next_button = eframe::egui::RichText::new("⏭ Next")
-                            .size(15.0)
-                            .color(eframe::egui::Color32::LIGHT_BLUE);
-                        if ui.button(next_button).clicked() {
-                            if self.current_index + 1 < self.playlist.len() {
-                                self.play_track(self.current_index + 1);
-                            } else if self.current_index + 1 == self.playlist.len() {
-                                self.play_track(0); // Зациклюємо на перший трек
-                            }
-                        }
-                        if ui
-                            .add(
-                                eframe::egui::Slider::new(&mut self.volume, 0.0..=3.0)
-                                    .show_value(false),
-                            )
-                            .changed()
-                        {
-                            self.shared_volume
-                                .store(self.volume.to_bits(), Ordering::Relaxed);
-                        }
-                    });
+                    // Малюємо керування
+                    self.draw_controls(ui);
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -256,8 +298,6 @@ impl eframe::App for PlayerApp {
             );
         });
 
-        // --- 3. ЗАПИТ НА НАСТУПНИЙ КАДР ---
-        // Якщо на паузі - не перемальовуємо інтерфейс 60 разів на секунду, економимо CPU!
         if self.is_playing {
             ui.ctx().request_repaint();
         }

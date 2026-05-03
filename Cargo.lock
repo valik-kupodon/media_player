@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "media_player"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "ffmpeg-next",

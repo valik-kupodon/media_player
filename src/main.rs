@@ -6,10 +6,8 @@ use gui::player_app::PlayerApp;
 use std::sync::mpsc;
 
 fn main() -> Result<(), eframe::Error> {
-    let playlist = vec![];
-
     let (_, video_rx) = mpsc::sync_channel(3);
-    let mut app = PlayerApp::new(video_rx, playlist);
+    let mut app = PlayerApp::new(video_rx);
     if !app.playlist.is_empty() {
         app.play_track(0);
     }

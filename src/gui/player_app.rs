@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
+use std::time::Duration;
 
 pub struct PlayerApp {
     video_rx: Receiver<VideoFrame>,
@@ -75,7 +76,7 @@ impl PlayerApp {
 
         // Запускаємо новий потік декодера
         // (старий потік тихо помре, щойно ми перезапишемо self.video_rx)
-        self.shared_paused.store(false, Ordering::Relaxed);
+        self.shared_paused.store(false, Ordering::SeqCst);
         Self::start_video_decoder(
             new_file,
             new_tx,
@@ -101,8 +102,7 @@ impl PlayerApp {
     /// Перемикання паузи (щоб не дублювати логіку в кнопці та пробілі)
     fn toggle_play(&mut self) {
         self.is_playing = !self.is_playing;
-        self.shared_paused
-            .store(!self.is_playing, Ordering::Relaxed);
+        self.shared_paused.store(!self.is_playing, Ordering::SeqCst);
     }
 
     /// Права панель - Плейлист
@@ -329,7 +329,9 @@ impl PlayerApp {
         }
 
         // 2. Якщо після дренування у нас є новий кадр - малюємо його
-        if let Some(frame) = latest_frame {
+        if self.is_playing
+            && let Some(frame) = latest_frame
+        {
             self.current_time = frame.pts;
             self.total_time = frame.duration;
 
@@ -386,6 +388,8 @@ impl eframe::App for PlayerApp {
 
         if self.is_playing {
             ui.ctx().request_repaint();
+        } else {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
     }
 }

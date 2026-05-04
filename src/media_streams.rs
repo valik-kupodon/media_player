@@ -341,7 +341,7 @@ impl MediaStreams {
     ) {
         let mut was_paused = false;
 
-        while shared_paused.load(Ordering::Relaxed) {
+        while shared_paused.load(Ordering::SeqCst) {
             if let Some(audio) = audio
                 && !audio.player.is_paused()
             {

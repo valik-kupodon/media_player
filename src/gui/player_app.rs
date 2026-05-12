@@ -62,6 +62,7 @@ impl PlayerApp {
         });
     }
 
+    #[inline]
     pub fn play_track(&mut self, index: usize) {
         if index >= self.playlist.len() {
             eprintln!("Індекс поза межами плейлиста: {}", index);
@@ -100,6 +101,7 @@ impl PlayerApp {
     }
 
     /// Перемикання паузи (щоб не дублювати логіку в кнопці та пробілі)
+    #[inline]
     fn toggle_play(&mut self) {
         self.is_playing = !self.is_playing;
         self.shared_paused.store(!self.is_playing, Ordering::SeqCst);
@@ -113,7 +115,7 @@ impl PlayerApp {
                 ui.heading("Плейлист");
                 ui.separator();
 
-                if ui.button("📂 Додати відео...").clicked() {
+                if ui.button("📂 Додати медіа файли...").clicked() {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         for path in files {
                             self.playlist.push(path.to_string_lossy().to_string());
@@ -289,68 +291,75 @@ impl PlayerApp {
         }
     }
     fn process_video_frames(&mut self, ctx: &eframe::egui::Context) {
-        // Якщо плеєр на паузі - взагалі не читаємо кадри
         if !self.is_playing {
             return;
         }
 
-        let mut latest_frame = None;
+        let mut latest_video_frame = None;
+        let mut latest_pts = None;
+        let mut latest_duration = None;
 
-        // 1. Дренуємо канал через loop + match
+        // 1. Дренуємо канал
         loop {
             match self.video_rx.try_recv() {
-                // Отримали кадр - запам'ятовуємо його як найсвіжіший і крутимо цикл далі
                 Ok(frame) => {
-                    latest_frame = Some(frame);
-                }
+                    // Час оновлюємо ЗАВЖДИ (навіть від dummy-кадрів з аудіо)
+                    latest_pts = Some(frame.pts);
+                    latest_duration = Some(frame.duration);
 
-                // Канали порожні, ми вичитали все, що було на цю мілісекунду.
-                // Зупиняємо дренування (виходимо з loop) і йдемо малювати.
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    break;
+                    // Зберігаємо картинку ТІЛЬКИ якщо вона реальна
+                    // (так обкладинка альбому ніколи не зникне з екрану!)
+                    if frame.width > 0 && frame.height > 0 && !frame.rgb_data.is_empty() {
+                        latest_video_frame = Some(frame);
+                    }
                 }
-
-                // Зв'язок розірвано! Відео закінчилося.
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // ТУТ ЖИВЕ АВТОВІДТВОРЕННЯ
+                    // АВТОВІДТВОРЕННЯ
                     if self.current_index + 1 < self.playlist.len() {
                         self.play_track(self.current_index + 1);
                     } else {
-                        // Плейлист закінчився, зациклюємо його
                         self.current_time = 0.0;
                         self.texture = None;
-                        self.play_track(1);
+                        self.play_track(0); // Повертаємось на початок
                     }
-
-                    // КРИТИЧНО: виходимо з усієї функції, бо трек вже перемкнувся!
                     return;
                 }
             }
         }
 
-        // 2. Якщо після дренування у нас є новий кадр - малюємо його
-        if self.is_playing
-            && let Some(frame) = latest_frame
-        {
-            self.current_time = frame.pts;
-            self.total_time = frame.duration;
+        // 2. Оновлюємо стан UI
+        if let Some(pts) = latest_pts {
+            self.current_time = pts;
+        }
+        if let Some(dur) = latest_duration {
+            self.total_time = dur;
+        }
 
+        // Оновлюємо текстуру тільки якщо прилетів новий РЕАЛЬНИЙ кадр
+        if let Some(frame) = latest_video_frame {
             let image =
                 eframe::egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb_data);
-
             self.texture =
                 Some(ctx.load_texture("vid_frame", image, eframe::egui::TextureOptions::LINEAR));
         }
     }
 
+    #[inline]
     fn format_time(seconds: f64) -> String {
         if seconds.is_nan() || seconds < 0.0 {
             return "00:00".to_string();
         }
+
         let total_secs = seconds as u64;
-        let mins = total_secs / 60;
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
         let secs = total_secs % 60;
-        format!("{:02}:{:02}", mins, secs)
+        if hours > 0 {
+            format!("{:02}:{:02}:{:02}", hours, mins, secs)
+        } else {
+            format!("{:02}:{:02}", mins, secs)
+        }
     }
 }
 

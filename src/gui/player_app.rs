@@ -62,6 +62,7 @@ impl PlayerApp {
         });
     }
 
+    #[inline]
     pub fn play_track(&mut self, index: usize) {
         if index >= self.playlist.len() {
             eprintln!("Індекс поза межами плейлиста: {}", index);
@@ -100,6 +101,7 @@ impl PlayerApp {
     }
 
     /// Перемикання паузи (щоб не дублювати логіку в кнопці та пробілі)
+    #[inline]
     fn toggle_play(&mut self) {
         self.is_playing = !self.is_playing;
         self.shared_paused.store(!self.is_playing, Ordering::SeqCst);
@@ -343,6 +345,7 @@ impl PlayerApp {
         }
     }
 
+    #[inline]
     fn format_time(seconds: f64) -> String {
         if seconds.is_nan() || seconds < 0.0 {
             return "00:00".to_string();

@@ -177,6 +177,7 @@ impl MediaStreams {
     // ==========================================
 
     /// Обробляє запити на перемотування
+    #[inline]
     fn handle_seek(
         ictx: &mut ffmpeg::format::context::Input,
         video: &mut Option<VideoPlayback>,
@@ -205,6 +206,7 @@ impl MediaStreams {
 
     /// Вичитує кадри з відеодекодера та відправляє їх в UI
     /// Повертає `false`, якщо потік треба завершити (UI відключився)
+    #[inline]
     fn drain_video_decoder(
         video: &mut VideoPlayback,
         audio: Option<&AudioPlayback>,
@@ -231,6 +233,7 @@ impl MediaStreams {
     }
 
     /// Вичитує кадри з аудіодекодера, обробляє звук і надсилає "пульс часу" для UI
+    #[inline]
     fn drain_audio_decoder(
         audio: &mut AudioPlayback,
         video_is_none: bool,
@@ -438,6 +441,7 @@ impl MediaStreams {
         }
     }
 
+    #[inline]
     fn wait_if_paused(
         audio: Option<&AudioPlayback>,
         shared_paused: &AtomicBool,

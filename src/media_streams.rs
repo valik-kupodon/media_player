@@ -15,6 +15,120 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+// ==========================================
+// ВІЗУАЛІЗАТОРИ (АБСТРАКЦІЯ ТА РЕАЛІЗАЦІЯ)
+// ==========================================
+
+pub trait AudioVisualizer: Send {
+    /// Аналізує сирі аудіодані (наприклад, для розрахунку басу)
+    fn analyze_audio(&mut self, samples: &[f32]);
+    /// Генерує кадр на основі часу та проаналізованого звуку
+    fn render(&self, pts: f64, width: usize, height: usize) -> Vec<u8>;
+}
+
+pub struct PlasmaVisualizer {
+    smoothed_bass: f32,
+}
+
+impl PlasmaVisualizer {
+    pub fn new() -> Self {
+        Self { smoothed_bass: 0.0 }
+    }
+}
+
+impl AudioVisualizer for PlasmaVisualizer {
+    fn analyze_audio(&mut self, samples: &[f32]) {
+        let mut lp = 0.0;
+        let alpha = 0.05;
+        let mut bass_energy = 0.0;
+
+        for &sample in samples {
+            lp += alpha * (sample - lp);
+            bass_energy += lp * lp;
+        }
+
+        let bass_rms = if samples.is_empty() {
+            0.0
+        } else {
+            (bass_energy / samples.len() as f32).sqrt()
+        };
+
+        // Згладжування басу (Attack / Release)
+        if bass_rms > self.smoothed_bass {
+            self.smoothed_bass = bass_rms; // Attack
+        } else {
+            self.smoothed_bass = self.smoothed_bass * 0.85 + bass_rms * 0.15; // Release
+        }
+    }
+
+    #[inline]
+    fn render(&self, pts: f64, width: usize, height: usize) -> Vec<u8> {
+        let mut rgb_data = Vec::with_capacity(width * height * 3);
+        let t = pts as f32;
+
+        let pulse = (self.smoothed_bass * 40.0).min(1.5);
+
+        // Коригуємо пропорції, щоб тунель був ідеально круглим, а не овальним
+        let aspect = width as f32 / height as f32;
+
+        for y in 0..height {
+            // Нормалізуємо Y від -0.5 до 0.5
+            let fy = (y as f32 / height as f32) - 0.5;
+
+            for x in 0..width {
+                // Нормалізуємо X з урахуванням пропорцій екрану
+                let fx = ((x as f32 / width as f32) - 0.5) * aspect;
+
+                // 1. ПОЛЯРНІ КООРДИНАТИ
+                let dist = (fx * fx + fy * fy).sqrt();
+                let angle = fy.atan2(fx);
+
+                // 2. ІЛЮЗІЯ 3D-ГЛИБИНИ
+                // Чим ближче до центру (dist ~ 0), тим далі "стіна" (z -> ∞)
+                // Додаємо 0.01, щоб уникнути ділення на нуль в самому центрі
+                let z = 1.0 / (dist + 0.01);
+
+                // 3. РУХ У ТУНЕЛІ
+                // u = рух вперед. Додаємо бас, щоб "пірнати" швидше під час удару!
+                let u = z + t * 5.0 + pulse;
+                // v = обертання стін (залежить від кута і плавно крутиться з часом)
+                let v = (angle * 3.0) + t * 2.0;
+
+                // 4. ВІЗЕРУНОК СТІН (Сітка або Фрактал)
+                // Змішуємо синуси u та v, щоб створити абстрактні квадрати/ромби
+                let pattern = ((u * 3.14).sin() * (v * 3.14).cos()).abs();
+
+                // 5. ЗАТЕМНЕННЯ (Світло в кінці тунелю)
+                // dist зменшується до центру, тому центр буде чорним
+                let shade = (dist * 2.5).clamp(0.0, 1.0);
+
+                // 6. ПЛАВНА ВЕСЕЛКА (Зсув фаз)
+                // Колір залежить від часу та глибини (z)
+                let color_phase = t * 1.0 + z * 0.2;
+
+                // Зсуваємо синусоїду на 120 градусів для RGB, щоб отримати ідеальну веселку
+                let r_base = (color_phase).sin();
+                let g_base = (color_phase + 2.094).sin(); // 2PI/3
+                let b_base = (color_phase + 4.188).sin(); // 4PI/3
+
+                // 7. ЗБИРАЄМО ПІКСЕЛЬ
+                let r = ((r_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
+                let g = ((g_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
+                let b = ((b_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
+
+                rgb_data.push(r);
+                rgb_data.push(g);
+                rgb_data.push(b);
+            }
+        }
+        rgb_data
+    }
+}
+
+// ==========================================
+// СТРУКТУРИ ПЛЕЄРА
+// ==========================================
+
 pub struct VideoFrame {
     pub width: usize,
     pub height: usize,
@@ -66,7 +180,6 @@ impl MediaStreams {
         }
     }
 
-    // Головна функція тепер виглядає максимально чисто і зрозуміло!
     pub fn play_with_video_tx(
         &self,
         video_tx: SyncSender<VideoFrame>,
@@ -79,7 +192,11 @@ impl MediaStreams {
         let mut audio = Self::create_audio_playback(&ictx)?;
 
         let mut master_clock: Option<(f64, Instant)> = None;
-        let mut last_dummy_send = Instant::now(); // Таймер для оновлення повзунка аудіо
+        let mut last_dummy_send = Instant::now();
+
+        // 🟢 Ініціалізуємо візуалізатор (за замовчуванням - Плазма)
+        let mut visualizer: Option<Box<dyn AudioVisualizer>> =
+            Some(Box::new(PlasmaVisualizer::new()));
 
         loop {
             Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut master_clock);
@@ -93,7 +210,7 @@ impl MediaStreams {
 
             let mut packet = ffmpeg::Packet::empty();
             if packet.read(&mut ictx).is_err() {
-                break; // Пакети закінчилися (EOF)
+                break;
             }
 
             if let Some(v) = video.as_mut() {
@@ -107,7 +224,7 @@ impl MediaStreams {
                         &video_tx,
                         duration,
                     )? {
-                        return Ok(()); // Перемкнули трек
+                        return Ok(());
                     }
                 }
             }
@@ -124,14 +241,14 @@ impl MediaStreams {
                         &video_tx,
                         duration,
                         &mut last_dummy_send,
+                        &mut visualizer,
                     )? {
-                        return Ok(()); // Перемкнули трек
+                        return Ok(());
                     }
                 }
             }
         }
 
-        // --- БЛОК ОЧИЩЕННЯ ПІСЛЯ КІНЦЯ ФАЙЛУ (EOF) ---
         if let Some(v) = video.as_mut() {
             v.decoder.send_eof()?;
             if !Self::drain_video_decoder(
@@ -157,6 +274,7 @@ impl MediaStreams {
                 &video_tx,
                 duration,
                 &mut last_dummy_send,
+                &mut visualizer,
             )? {
                 return Ok(());
             }
@@ -169,14 +287,27 @@ impl MediaStreams {
             a.player.sleep_until_end();
         }
 
+        if audio.is_none() && duration <= 0.1 {
+            loop {
+                let dummy_frame = VideoFrame {
+                    width: 0,
+                    height: 0,
+                    rgb_data: vec![],
+                    pts: master_clock
+                        .map(|(origin_pts, start)| origin_pts + start.elapsed().as_secs_f64())
+                        .unwrap_or(0.0),
+                    duration,
+                };
+                if video_tx.try_send(dummy_frame).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
         Ok(())
     }
 
-    // ==========================================
-    // НОВІ ВИДІЛЕНІ МЕТОДИ (РЕФАКТОРИНГ)
-    // ==========================================
-
-    /// Обробляє запити на перемотування
     #[inline]
     fn handle_seek(
         ictx: &mut ffmpeg::format::context::Input,
@@ -204,8 +335,6 @@ impl MediaStreams {
         }
     }
 
-    /// Вичитує кадри з відеодекодера та відправляє їх в UI
-    /// Повертає `false`, якщо потік треба завершити (UI відключився)
     #[inline]
     fn drain_video_decoder(
         video: &mut VideoPlayback,
@@ -225,14 +354,13 @@ impl MediaStreams {
 
             match video_tx.try_send(frame) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => {} // Не встигаємо - дропаємо кадр
-                Err(TrySendError::Disconnected(_)) => return Ok(false), // Зв'язок розірвано
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => return Ok(false),
             }
         }
         Ok(true)
     }
 
-    /// Вичитує кадри з аудіодекодера, обробляє звук і надсилає "пульс часу" для UI
     #[inline]
     fn drain_audio_decoder(
         audio: &mut AudioPlayback,
@@ -243,6 +371,7 @@ impl MediaStreams {
         video_tx: &SyncSender<VideoFrame>,
         duration: f64,
         last_dummy_send: &mut Instant,
+        visualizer: &mut Option<Box<dyn AudioVisualizer>>,
     ) -> Result<bool, Box<dyn Error>> {
         while audio
             .decoder
@@ -261,18 +390,68 @@ impl MediaStreams {
                 *master_clock = Some((audio_pts, Instant::now()));
             }
 
-            // Відправляємо час в UI, щоб повзунок рухався (навіть якщо це обкладинка альбому)
-            if video_is_none || last_dummy_send.elapsed() > Duration::from_millis(100) {
-                let dummy_frame = VideoFrame {
-                    width: 0,
-                    height: 0,
-                    rgb_data: vec![],
-                    pts: audio_pts,
-                    duration,
-                };
-                match video_tx.try_send(dummy_frame) {
-                    Ok(()) | Err(TrySendError::Full(_)) => *last_dummy_send = Instant::now(),
-                    Err(TrySendError::Disconnected(_)) => return Ok(false),
+            if video_is_none {
+                // 🟢 Якщо є візуалізатор — задіюємо його
+                if let Some(vis) = visualizer.as_mut() {
+                    // Дістаємо байти для аналізу
+                    let raw_data = audio.decoded_frame.data(0);
+                    let samples: Vec<f32> = raw_data
+                        .chunks_exact(std::mem::size_of::<f32>())
+                        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+                        .collect();
+
+                    vis.analyze_audio(&samples);
+
+                    if last_dummy_send.elapsed() > Duration::from_millis(33) {
+                        let width = 256;
+                        let height = 144;
+                        let rgb_data = vis.render(audio_pts, width, height);
+
+                        let visual_frame = VideoFrame {
+                            width,
+                            height,
+                            rgb_data,
+                            pts: audio_pts,
+                            duration,
+                        };
+                        match video_tx.try_send(visual_frame) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {
+                                *last_dummy_send = Instant::now()
+                            }
+                            Err(TrySendError::Disconnected(_)) => return Ok(false),
+                        }
+                    }
+                } else {
+                    // Якщо візуалізатора немає, просто шлемо пульс
+                    if last_dummy_send.elapsed() > Duration::from_millis(100) {
+                        let dummy_frame = VideoFrame {
+                            width: 0,
+                            height: 0,
+                            rgb_data: vec![],
+                            pts: audio_pts,
+                            duration,
+                        };
+                        match video_tx.try_send(dummy_frame) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {
+                                *last_dummy_send = Instant::now()
+                            }
+                            Err(TrySendError::Disconnected(_)) => return Ok(false),
+                        }
+                    }
+                }
+            } else {
+                if last_dummy_send.elapsed() > Duration::from_millis(100) {
+                    let dummy_frame = VideoFrame {
+                        width: 0,
+                        height: 0,
+                        rgb_data: vec![],
+                        pts: audio_pts,
+                        duration,
+                    };
+                    match video_tx.try_send(dummy_frame) {
+                        Ok(()) | Err(TrySendError::Full(_)) => *last_dummy_send = Instant::now(),
+                        Err(TrySendError::Disconnected(_)) => return Ok(false),
+                    }
                 }
             }
 
@@ -284,7 +463,6 @@ impl MediaStreams {
                 current_volume,
             )?;
 
-            // Гальма для синхронізації (щоб не розкодувати весь файл за секунду)
             if let Some((start_pts, start_time)) = master_clock {
                 let actual_elapsed = start_time.elapsed().as_secs_f64();
                 let target_elapsed = audio_pts - *start_pts;
@@ -297,10 +475,6 @@ impl MediaStreams {
         }
         Ok(true)
     }
-
-    // ==========================================
-    // СТАРІ МЕТОДИ (БЕЗ ЗМІН)
-    // ==========================================
 
     fn create_video_playback(
         ictx: &ffmpeg::format::context::Input,
@@ -473,11 +647,12 @@ impl MediaStreams {
         player: &Player,
         resampler: &mut AudioResampler,
         decoded_frame: &ffmpeg::frame::Audio,
-        currnet_volume: f32,
+        current_volume: f32,
     ) -> Result<(), Box<dyn Error>> {
         let mut resampled_frame = ffmpeg::frame::Audio::empty();
         resampler.run(decoded_frame, &mut resampled_frame)?;
-        Self::queue_audio_buffer(player, &resampled_frame, currnet_volume)
+        Self::queue_audio_buffer(player, &resampled_frame, current_volume)?;
+        Ok(())
     }
 
     fn queue_audio_buffer(

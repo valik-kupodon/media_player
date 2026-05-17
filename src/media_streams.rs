@@ -1,3 +1,4 @@
+use crate::gui::visualizers::{AudioVisualizer, EqualizerVisualizer, PlasmaVisualizer};
 use ffmpeg::format::{Pixel, Sample};
 use ffmpeg::media::Type;
 use ffmpeg::software::resampling::Context as AudioResampler;
@@ -10,120 +11,10 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
-
-// ==========================================
-// ВІЗУАЛІЗАТОРИ (АБСТРАКЦІЯ ТА РЕАЛІЗАЦІЯ)
-// ==========================================
-
-pub trait AudioVisualizer: Send {
-    /// Аналізує сирі аудіодані (наприклад, для розрахунку басу)
-    fn analyze_audio(&mut self, samples: &[f32]);
-    /// Генерує кадр на основі часу та проаналізованого звуку
-    fn render(&self, pts: f64, width: usize, height: usize) -> Vec<u8>;
-}
-
-pub struct PlasmaVisualizer {
-    smoothed_bass: f32,
-}
-
-impl PlasmaVisualizer {
-    pub fn new() -> Self {
-        Self { smoothed_bass: 0.0 }
-    }
-}
-
-impl AudioVisualizer for PlasmaVisualizer {
-    fn analyze_audio(&mut self, samples: &[f32]) {
-        let mut lp = 0.0;
-        let alpha = 0.05;
-        let mut bass_energy = 0.0;
-
-        for &sample in samples {
-            lp += alpha * (sample - lp);
-            bass_energy += lp * lp;
-        }
-
-        let bass_rms = if samples.is_empty() {
-            0.0
-        } else {
-            (bass_energy / samples.len() as f32).sqrt()
-        };
-
-        // Згладжування басу (Attack / Release)
-        if bass_rms > self.smoothed_bass {
-            self.smoothed_bass = bass_rms; // Attack
-        } else {
-            self.smoothed_bass = self.smoothed_bass * 0.85 + bass_rms * 0.15; // Release
-        }
-    }
-
-    #[inline]
-    fn render(&self, pts: f64, width: usize, height: usize) -> Vec<u8> {
-        let mut rgb_data = Vec::with_capacity(width * height * 3);
-        let t = pts as f32;
-
-        let pulse = (self.smoothed_bass * 40.0).min(1.5);
-
-        // Коригуємо пропорції, щоб тунель був ідеально круглим, а не овальним
-        let aspect = width as f32 / height as f32;
-
-        for y in 0..height {
-            // Нормалізуємо Y від -0.5 до 0.5
-            let fy = (y as f32 / height as f32) - 0.5;
-
-            for x in 0..width {
-                // Нормалізуємо X з урахуванням пропорцій екрану
-                let fx = ((x as f32 / width as f32) - 0.5) * aspect;
-
-                // 1. ПОЛЯРНІ КООРДИНАТИ
-                let dist = (fx * fx + fy * fy).sqrt();
-                let angle = fy.atan2(fx);
-
-                // 2. ІЛЮЗІЯ 3D-ГЛИБИНИ
-                // Чим ближче до центру (dist ~ 0), тим далі "стіна" (z -> ∞)
-                // Додаємо 0.01, щоб уникнути ділення на нуль в самому центрі
-                let z = 1.0 / (dist + 0.01);
-
-                // 3. РУХ У ТУНЕЛІ
-                // u = рух вперед. Додаємо бас, щоб "пірнати" швидше під час удару!
-                let u = z + t * 5.0 + pulse;
-                // v = обертання стін (залежить від кута і плавно крутиться з часом)
-                let v = (angle * 3.0) + t * 2.0;
-
-                // 4. ВІЗЕРУНОК СТІН (Сітка або Фрактал)
-                // Змішуємо синуси u та v, щоб створити абстрактні квадрати/ромби
-                let pattern = ((u * 3.14).sin() * (v * 3.14).cos()).abs();
-
-                // 5. ЗАТЕМНЕННЯ (Світло в кінці тунелю)
-                // dist зменшується до центру, тому центр буде чорним
-                let shade = (dist * 2.5).clamp(0.0, 1.0);
-
-                // 6. ПЛАВНА ВЕСЕЛКА (Зсув фаз)
-                // Колір залежить від часу та глибини (z)
-                let color_phase = t * 1.0 + z * 0.2;
-
-                // Зсуваємо синусоїду на 120 градусів для RGB, щоб отримати ідеальну веселку
-                let r_base = (color_phase).sin();
-                let g_base = (color_phase + 2.094).sin(); // 2PI/3
-                let b_base = (color_phase + 4.188).sin(); // 4PI/3
-
-                // 7. ЗБИРАЄМО ПІКСЕЛЬ
-                let r = ((r_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
-                let g = ((g_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
-                let b = ((b_base * 0.5 + 0.5) * pattern * shade * 255.0) as u8;
-
-                rgb_data.push(r);
-                rgb_data.push(g);
-                rgb_data.push(b);
-            }
-        }
-        rgb_data
-    }
-}
 
 // ==========================================
 // СТРУКТУРИ ПЛЕЄРА
@@ -142,6 +33,7 @@ pub struct MediaStreams {
     shared_volume: Arc<AtomicU32>,
     shared_paused: Arc<AtomicBool>,
     shared_seek: Arc<AtomicU64>,
+    shared_visualizer: Arc<AtomicI8>,
 }
 
 struct VideoPlayback {
@@ -171,12 +63,14 @@ impl MediaStreams {
         shared_volume: Arc<AtomicU32>,
         shared_paused: Arc<AtomicBool>,
         shared_seek: Arc<AtomicU64>,
+        shared_visualizer: Arc<AtomicI8>,
     ) -> Self {
         Self {
             file_path: file_path.into(),
             shared_volume,
             shared_paused,
             shared_seek,
+            shared_visualizer,
         }
     }
 
@@ -193,11 +87,9 @@ impl MediaStreams {
 
         let mut master_clock: Option<(f64, Instant)> = None;
         let mut last_dummy_send = Instant::now();
-
-        // 🟢 Ініціалізуємо візуалізатор (за замовчуванням - Плазма)
+        let mut current_visualizer_type = 1;
         let mut visualizer: Option<Box<dyn AudioVisualizer>> =
             Some(Box::new(PlasmaVisualizer::new()));
-
         loop {
             Self::wait_if_paused(audio.as_ref(), &self.shared_paused, &mut master_clock);
             Self::handle_seek(
@@ -207,7 +99,15 @@ impl MediaStreams {
                 &self.shared_seek,
                 &mut master_clock,
             );
-
+            if self.shared_visualizer.load(Ordering::Relaxed) != current_visualizer_type {
+                current_visualizer_type = self.shared_visualizer.load(Ordering::Relaxed);
+                visualizer = match current_visualizer_type {
+                    0 => None, // Вимкнено
+                    1 => Some(Box::new(PlasmaVisualizer::new())),
+                    2 => Some(Box::new(EqualizerVisualizer::new())),
+                    _ => None, // Можна додати більше візуалізаторів і вибирати їх за індексом
+                };
+            };
             let mut packet = ffmpeg::Packet::empty();
             if packet.read(&mut ictx).is_err() {
                 break;

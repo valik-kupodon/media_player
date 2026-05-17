@@ -3,7 +3,7 @@ use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -23,6 +23,8 @@ pub struct PlayerApp {
     shared_seek: Arc<AtomicU64>,
     is_dragging: bool,
     drag_time: f64,
+    visual_index: i8,
+    shared_visual: Arc<AtomicI8>,
 }
 
 impl PlayerApp {
@@ -42,6 +44,8 @@ impl PlayerApp {
             shared_seek: Arc::new(AtomicU64::new(0)),
             is_dragging: false,
             drag_time: 0.0,
+            visual_index: 1,
+            shared_visual: Arc::new(AtomicI8::new(1)),
         }
     }
 
@@ -51,10 +55,16 @@ impl PlayerApp {
         shared_volume: Arc<AtomicU32>,
         shared_paused: Arc<AtomicBool>,
         shader_seek: Arc<AtomicU64>,
+        shared_visual: Arc<AtomicI8>,
     ) {
         thread::spawn(move || {
-            let media_streams =
-                MediaStreams::new(file_path, shared_volume, shared_paused, shader_seek);
+            let media_streams = MediaStreams::new(
+                file_path,
+                shared_volume,
+                shared_paused,
+                shader_seek,
+                shared_visual,
+            );
 
             if let Err(e) = media_streams.play_with_video_tx(video_tx) {
                 eprintln!("Помилка при відтворенні медіа: {}", e);
@@ -84,6 +94,7 @@ impl PlayerApp {
             Arc::clone(&self.shared_volume),
             Arc::clone(&self.shared_paused),
             Arc::clone(&self.shared_seek),
+            Arc::clone(&self.shared_visual),
         );
 
         // Підміняємо трубу та очищаємо старий кадр
@@ -237,6 +248,38 @@ impl PlayerApp {
             ui.separator();
             self.draw_nav_buttons(ui);
             self.draw_volume_slider(ui);
+            ui.separator();
+            ui.label("✨ Візуал:");
+            eframe::egui::ComboBox::from_id_salt("vis_combo")
+                .selected_text(match self.visual_index {
+                    0 => "Вимкнено",
+                    1 => "Кроляча нора",
+                    2 => "Еквалайзер",
+                    _ => "Невідомо",
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.visual_index == 0, "Вимкнено")
+                        .clicked()
+                    {
+                        self.visual_index = 0;
+                        self.shared_visual.store(0, Ordering::Relaxed);
+                    }
+                    if ui
+                        .selectable_label(self.visual_index == 1, "Кроляча нора")
+                        .clicked()
+                    {
+                        self.visual_index = 1;
+                        self.shared_visual.store(1, Ordering::Relaxed);
+                    }
+                    if ui
+                        .selectable_label(self.visual_index == 2, "Еквалайзер")
+                        .clicked()
+                    {
+                        self.visual_index = 2;
+                        self.shared_visual.store(2, Ordering::Relaxed);
+                    }
+                });
             let toggle_text = if self.is_hide_playlist {
                 "📂 Показати плейлист"
             } else {

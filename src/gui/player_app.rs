@@ -1,5 +1,6 @@
 use crate::media_streams::{MediaStreams, VideoFrame};
 use eframe::egui;
+use keepawake::KeepAwake;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{
     Arc,
@@ -25,6 +26,7 @@ pub struct PlayerApp {
     drag_time: f64,
     visual_index: i8,
     shared_visual: Arc<AtomicI8>,
+    keep_awake: Option<KeepAwake>,
 }
 
 impl PlayerApp {
@@ -46,6 +48,7 @@ impl PlayerApp {
             drag_time: 0.0,
             visual_index: 1,
             shared_visual: Arc::new(AtomicI8::new(1)),
+            keep_awake: keepawake::Builder::default().display(true).create().ok(),
         }
     }
 
@@ -82,6 +85,8 @@ impl PlayerApp {
         self.current_index = index;
         let new_file = self.playlist[self.current_index].clone();
 
+        self.keep_awake = keepawake::Builder::default().display(true).create().ok();
+
         // Створюємо абсолютно нову трубу
         let (new_tx, new_rx) = std::sync::mpsc::sync_channel(3);
 
@@ -116,6 +121,11 @@ impl PlayerApp {
     fn toggle_play(&mut self) {
         self.is_playing = !self.is_playing;
         self.shared_paused.store(!self.is_playing, Ordering::SeqCst);
+        if self.is_playing {
+            self.keep_awake = keepawake::Builder::default().display(true).create().ok();
+        } else {
+            self.keep_awake = None;
+        }
     }
 
     /// Права панель - Плейлист

@@ -132,7 +132,7 @@ impl PlayerApp {
     fn draw_playlist_panel(&mut self, ui: &mut eframe::egui::Ui) {
         eframe::egui::Panel::right("playlist_panel")
             .default_size(200.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.heading("Плейлист");
                 ui.separator();
 
@@ -426,12 +426,12 @@ impl eframe::App for PlayerApp {
         if !self.is_hide_playlist {
             self.draw_playlist_panel(ui);
         }
-        eframe::egui::Panel::bottom("controls_panel").show_inside(ui, |ui| {
+        eframe::egui::Panel::bottom("controls_panel").show(ui, |ui| {
             ui.add_space(8.0);
             self.draw_time_seeker(ui);
             self.draw_controls(ui);
         });
-        eframe::egui::CentralPanel::default().show_inside(ui, |ui| {
+        eframe::egui::CentralPanel::default().show(ui, |ui| {
             ui.ctx().set_visuals(eframe::egui::Visuals::dark());
 
             // МАЛЮВАННЯ САМОГО ВІДЕО
